@@ -54,16 +54,24 @@ from __future__ import annotations
 import json
 import logging
 import logging.handlers
+import re
+import socket
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import date, timedelta
+from html import unescape
+from http.cookiejar import CookieJar
 from pathlib import Path
 from typing import Optional
+from urllib.parse import unquote_plus, urlencode, urljoin, urlparse
+from urllib.error import HTTPError, URLError
+from urllib.request import HTTPCookieProcessor, Request, build_opener
 
 import pandas as pd
 from jugaad_trader import Zerodha
+from kiteconnect import KiteConnect
 from tabulate import tabulate
 
 # Suppress only specific, known-harmless pandas future warnings
@@ -557,12 +565,15 @@ class EntryFilter:
         latest_vol    = float(df["volume"].iloc[-1])
         avg_vol_50    = float(df["volume"].rolling(50).mean().iloc[-1])
 
-        vol_ratio      = round(latest_vol / avg_vol_50, 2) if avg_vol_50 > 0 else 0.0
-        pct_from_pivot = round((current_price - vcp.pivot) / vcp.pivot * 100, 2)
+        raw_vol_ratio      = latest_vol / avg_vol_50 if avg_vol_50 > 0 else 0.0
+        raw_pct_from_pivot = (current_price - vcp.pivot) / vcp.pivot * 100
 
-        in_buy_zone        = 0 <= pct_from_pivot <= self.BUY_ZONE_MAX_PCT * 100
-        extended           = pct_from_pivot > self.BUY_ZONE_MAX_PCT * 100
-        breakout_confirmed = in_buy_zone and vol_ratio >= self.MIN_VOL_RATIO
+        vol_ratio      = round(raw_vol_ratio, 2)
+        pct_from_pivot = round(raw_pct_from_pivot, 2)
+
+        in_buy_zone        = 0 <= raw_pct_from_pivot <= self.BUY_ZONE_MAX_PCT * 100
+        extended           = raw_pct_from_pivot > self.BUY_ZONE_MAX_PCT * 100
+        breakout_confirmed = in_buy_zone and raw_vol_ratio >= self.MIN_VOL_RATIO
 
         # ── Stop loss + profit targets (pivot = assumed entry) ────
         last_low = vcp.contractions[-1].low if vcp.contractions else vcp.pivot * 0.92
@@ -574,8 +585,10 @@ class EntryFilter:
         reason = ""
         if extended:
             reason = f"Extended {pct_from_pivot:.1f}% above pivot"
-        elif pct_from_pivot < 0:
+        elif raw_pct_from_pivot < 0:
             reason = f"Price {abs(pct_from_pivot):.1f}% below pivot"
+        elif in_buy_zone and raw_vol_ratio < self.MIN_VOL_RATIO:
+            reason = f"Volume {vol_ratio:.2f}x below required {self.MIN_VOL_RATIO:.2f}x"
 
         return EntryResult(
             in_buy_zone        = in_buy_zone,
@@ -698,6 +711,20 @@ class MasterScreener:
     concurrently via ThreadPoolExecutor, then collects and prints results.
     """
 
+    CHARTINK_PROCESS_URL = "https://chartink.com/screener/process"
+    CHARTINK_SYMBOL_COLUMNS = (
+        "nsecode",
+        "symbol",
+        "symbols",
+        "stock",
+        "ticker",
+        "scrip",
+        "name",
+    )
+    WATCHLIST_SOURCE_AUTO = "auto"
+    WATCHLIST_SOURCE_CHARTINK = "chartink"
+    WATCHLIST_SOURCE_SCREENER = "screener"
+
     def __init__(self, config: dict):
         self.config      = config
         self.max_workers = config.get("max_threads", 20)
@@ -714,6 +741,11 @@ class MasterScreener:
     # ── Watchlist ─────────────────────────────────────────────────
 
     def load_watchlist(self) -> list[str]:
+        if self.config.get("get_watchlist_from_url", False):
+            return self.load_watchlist_from_url()
+        return self.load_watchlist_from_file()
+
+    def load_watchlist_from_file(self) -> list[str]:
         csv_path = Path(self.config["csv_path"])
         if not csv_path.exists():
             raise FileNotFoundError(f"Watchlist file not found: {csv_path}")
@@ -746,6 +778,327 @@ class MasterScreener:
         )
         logger.info(f"Loaded {len(symbols)} symbols from '{csv_path.name}'")
         return symbols
+
+    def load_watchlist_from_url(self) -> list[str]:
+        watchlist_url = self.config.get("watchlist_url") or self.config.get("chartink_watchlist_url")
+        if not watchlist_url:
+            raise ValueError(
+                "get_watchlist_from_url is true, but no watchlist_url is configured."
+            )
+
+        source = self._resolve_watchlist_source(watchlist_url)
+        if source == self.WATCHLIST_SOURCE_CHARTINK:
+            return self.load_watchlist_from_chartink(watchlist_url)
+        if source == self.WATCHLIST_SOURCE_SCREENER:
+            return self.load_watchlist_from_screener(watchlist_url)
+        raise ValueError(f"Unsupported watchlist source '{source}' for URL: {watchlist_url}")
+
+    def load_watchlist_from_chartink(self, watchlist_url: str) -> list[str]:
+        logger.info(f"Loading watchlist from Chartink URL: {watchlist_url}")
+        opener = build_opener(HTTPCookieProcessor(CookieJar()))
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0 Safari/537.36"
+            ),
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": watchlist_url,
+        }
+
+        page_text = self._http_get_text(opener, watchlist_url, headers)
+
+        csrf_token = self._extract_csrf_token(page_text)
+        if csrf_token:
+            headers["X-CSRF-TOKEN"] = csrf_token
+
+        scan_clause = self.config.get("chartink_scan_clause")
+        if not scan_clause:
+            scan_clause = self._extract_chartink_scan_clause(page_text)
+        if not scan_clause:
+            raise ValueError(
+                "Could not find Chartink scan_clause on the page. "
+                "Add chartink_scan_clause to config.json for this screener."
+            )
+
+        scan_clause = self._normalise_scan_clause(scan_clause)
+        df = self._fetch_all_chartink_rows(opener, headers, scan_clause)
+
+        symbols = self._extract_symbols_from_df(df)
+        logger.info(f"Loaded {len(symbols)} symbols from Chartink")
+        return symbols
+
+    def load_watchlist_from_screener(self, watchlist_url: str) -> list[str]:
+        logger.info(f"Loading watchlist from Screener.in URL: {watchlist_url}")
+        opener = build_opener(HTTPCookieProcessor(CookieJar()))
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0 Safari/537.36"
+            ),
+            "Referer": watchlist_url,
+        }
+
+        page_urls = [watchlist_url]
+        symbols: list[str] = []
+        seen_pages: set[str] = set()
+        page_delay = float(self.config.get("screener_page_delay_sec", 1.0))
+
+        while page_urls:
+            page_url = page_urls.pop(0)
+            if page_url in seen_pages:
+                continue
+            seen_pages.add(page_url)
+
+            try:
+                page_text = self._http_get_text_with_retry(opener, page_url, headers)
+            except HTTPError as exc:
+                if exc.code == 429 and symbols:
+                    logger.warning(
+                        "Screener.in rate-limited a later page; "
+                        f"continuing with {len(self._normalise_symbols(symbols))} symbols already fetched."
+                    )
+                    break
+                raise
+
+            page_symbols = self._extract_screener_symbols(page_text)
+            symbols.extend(page_symbols)
+            logger.info(f"  Screener.in rows fetched: {len(symbols)}")
+
+            for next_url in self._extract_screener_page_urls(page_text, page_url):
+                if next_url not in seen_pages and next_url not in page_urls:
+                    page_urls.append(next_url)
+            if page_urls:
+                time.sleep(page_delay)
+
+        symbols = self._normalise_symbols(symbols)
+        if not symbols:
+            raise ValueError("Screener.in returned zero symbols for this screen.")
+
+        logger.info(f"Loaded {len(symbols)} symbols from Screener.in")
+        return symbols
+
+    def _resolve_watchlist_source(self, watchlist_url: str) -> str:
+        configured = str(
+            self.config.get("watchlist_source", self.WATCHLIST_SOURCE_AUTO)
+        ).strip().lower()
+        if configured and configured != self.WATCHLIST_SOURCE_AUTO:
+            return configured
+
+        host = urlparse(watchlist_url).netloc.lower()
+        if "chartink.com" in host:
+            return self.WATCHLIST_SOURCE_CHARTINK
+        if "screener.in" in host:
+            return self.WATCHLIST_SOURCE_SCREENER
+        raise ValueError(
+            "Could not auto-detect watchlist source. "
+            "Set watchlist_source to 'chartink' or 'screener' in config.json."
+        )
+
+    def _extract_screener_symbols(self, html_text: str) -> list[str]:
+        symbols = re.findall(
+            r'<a\s+href=["\']/company/([^/"?]+)/',
+            html_text,
+            flags=re.IGNORECASE,
+        )
+        if self.config.get("screener_include_numeric_codes", False):
+            return symbols
+        return [symbol for symbol in symbols if not symbol.isdigit()]
+
+    @staticmethod
+    def _extract_screener_page_urls(html_text: str, base_url: str) -> list[str]:
+        urls = []
+        pagination = re.search(
+            r'<div[^>]*class=["\'][^"\']*pagination[^"\']*["\'][^>]*>(.*?)</div>',
+            html_text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if not pagination:
+            return urls
+
+        for href in re.findall(r'href=["\']([^"\']*page=\d+[^"\']*)["\']', pagination.group(1), flags=re.IGNORECASE):
+            absolute_url = urljoin(base_url, unescape(href))
+            if absolute_url not in urls:
+                urls.append(absolute_url)
+        return urls
+
+    @staticmethod
+    def _normalise_symbols(symbols: list[str]) -> list[str]:
+        cleaned = []
+        for symbol in symbols:
+            symbol = str(symbol).strip().upper()
+            if symbol:
+                cleaned.append(symbol)
+        return list(dict.fromkeys(cleaned))
+
+    @staticmethod
+    def _http_get_text(opener, url: str, headers: dict[str, str]) -> str:
+        request = Request(url, headers=headers, method="GET")
+        with opener.open(request, timeout=30) as response:
+            charset = response.headers.get_content_charset() or "utf-8"
+            return response.read().decode(charset, errors="replace")
+
+    def _http_get_text_with_retry(
+        self,
+        opener,
+        url: str,
+        headers: dict[str, str],
+    ) -> str:
+        max_retries = int(self.config.get("screener_max_retries", self.config.get("max_retries", 3)))
+        base_delay = float(self.config.get("screener_retry_base_delay", self.config.get("retry_base_delay", 2.0)))
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                return self._http_get_text(opener, url, headers)
+            except HTTPError as exc:
+                if exc.code != 429 or attempt == max_retries:
+                    raise
+                wait = base_delay * (2 ** (attempt - 1))
+                logger.warning(
+                    f"Screener.in rate-limited request "
+                    f"(attempt {attempt}/{max_retries}); retrying in {wait:.0f}s"
+                )
+                time.sleep(wait)
+            except (URLError, socket.timeout) as exc:
+                if attempt == max_retries:
+                    raise
+                wait = base_delay * (2 ** (attempt - 1))
+                logger.warning(
+                    f"Screener.in request failed ({exc}); retrying in {wait:.0f}s"
+                )
+                time.sleep(wait)
+
+        raise RuntimeError(f"Failed to fetch Screener.in URL after retries: {url}")
+
+    @staticmethod
+    def _http_post_json(
+        opener,
+        url: str,
+        headers: dict[str, str],
+        payload: dict,
+    ) -> dict:
+        request_headers = {
+            **headers,
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        }
+        request = Request(
+            url,
+            data=urlencode(payload).encode("utf-8"),
+            headers=request_headers,
+            method="POST",
+        )
+        with opener.open(request, timeout=30) as response:
+            charset = response.headers.get_content_charset() or "utf-8"
+            body = response.read().decode(charset, errors="replace")
+        return json.loads(body)
+
+    def _fetch_all_chartink_rows(
+        self,
+        opener,
+        headers: dict[str, str],
+        scan_clause: str,
+    ) -> pd.DataFrame:
+        page_size = int(self.config.get("chartink_page_size", 500))
+        page_size = max(page_size, 50)
+        start = 0
+        rows: list[dict] = []
+        expected_total = None
+
+        while True:
+            payload = {
+                "scan_clause": scan_clause,
+                "draw": (start // page_size) + 1,
+                "start": start,
+                "length": page_size,
+            }
+            result = self._http_post_json(opener, self.CHARTINK_PROCESS_URL, headers, payload)
+
+            batch = result.get("data") or []
+            if not isinstance(batch, list):
+                raise ValueError("Unexpected Chartink response: 'data' is not a list")
+
+            rows.extend(batch)
+            expected_total = (
+                result.get("recordsFiltered")
+                or result.get("recordsTotal")
+                or expected_total
+            )
+
+            logger.info(
+                f"  Chartink rows fetched: {len(rows)}"
+                + (f"/{expected_total}" if expected_total else "")
+            )
+
+            if not batch:
+                break
+            if expected_total is not None and len(rows) >= int(expected_total):
+                break
+            if expected_total is None and len(batch) < page_size:
+                break
+
+            start += page_size
+
+        if not rows:
+            raise ValueError("Chartink returned zero rows for this screener.")
+
+        return pd.DataFrame(rows)
+
+    def _extract_symbols_from_df(self, df: pd.DataFrame) -> list[str]:
+        if df.empty:
+            raise ValueError("Watchlist source did not contain any rows.")
+
+        symbol_col = None
+        for col in df.columns:
+            if str(col).strip().lower() in self.CHARTINK_SYMBOL_COLUMNS:
+                symbol_col = col
+                break
+
+        if symbol_col is None:
+            symbol_col = df.columns[0]
+            logger.info(f"Symbol column not found by name - using first column: '{symbol_col}'")
+
+        symbols = (
+            df[symbol_col]
+            .dropna()
+            .astype(str)
+            .str.strip()
+            .str.upper()
+        )
+        symbols = self._normalise_symbols(symbols.tolist())
+        if not symbols:
+            raise ValueError(f"No symbols found in column '{symbol_col}'.")
+        return symbols
+
+    @staticmethod
+    def _extract_csrf_token(html_text: str) -> Optional[str]:
+        for tag in re.findall(r"<meta\b[^>]*>", html_text, flags=re.IGNORECASE):
+            if re.search(r'name=["\']csrf-token["\']', tag, flags=re.IGNORECASE):
+                content = re.search(r'content=["\']([^"\']+)["\']', tag, flags=re.IGNORECASE)
+                if content:
+                    return unescape(content.group(1))
+        return None
+
+    @staticmethod
+    def _extract_chartink_scan_clause(html_text: str) -> Optional[str]:
+        patterns = (
+            r'&quot;atlas_query&quot;:&quot;(.*?)&quot;',
+            r'name=["\']scan_clause["\'][^>]*value=["\']([^"\']+)["\']',
+            r'value=["\']([^"\']+)["\'][^>]*name=["\']scan_clause["\']',
+            r'scan_clause\s*[:=]\s*["\'](.+?)["\']',
+        )
+        for pattern in patterns:
+            match = re.search(pattern, html_text, flags=re.IGNORECASE | re.DOTALL)
+            if match:
+                return unescape(match.group(1)).replace(r"\/", "/").replace(r"\"", '"')
+        return None
+
+    @staticmethod
+    def _normalise_scan_clause(scan_clause: str) -> str:
+        clause = unquote_plus(unescape(str(scan_clause))).strip()
+        if "(+" in clause or "+)" in clause or "+[" in clause or "+{" in clause:
+            clause = clause.replace("+", " ")
+        return clause
 
     # ── Concurrent scan ───────────────────────────────────────────
 

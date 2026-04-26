@@ -9,7 +9,7 @@ This screener identifies stocks in Stage 2 uptrends with valid Volatility Contra
 ## Pipeline
 
 ```
-1. Load watchlist from CSV/Excel  (pre-filtered by Trend Template)
+1. Load watchlist from CSV/Excel, Chartink, or Screener.in
 2. Fetch 6 months daily OHLCV via Zerodha KiteConnect
 3. VCP Detection — run on BOTH 6M and 3M windows (stock passes if EITHER yields valid VCP)
 4. Entry/Breakout filter  (price in buy zone + volume surge)
@@ -43,7 +43,54 @@ Fetches daily OHLCV data from Zerodha KiteConnect historical data API.
 
 ---
 
-### 2. VCP Detector (`VCPDetector`)
+### 2. Watchlist Loader (`MasterScreener`)
+
+Loads symbols from one of three supported sources:
+
+1. Local CSV/Excel file via `csv_path`
+2. Chartink screener URL
+3. Screener.in screen URL
+
+**Configuration (config.json):**
+```json
+"csv_path": "Backtest Mark Minervini - Drilldown.csv",
+"get_watchlist_from_url": true,
+"watchlist_source": "auto",
+"watchlist_url": "https://chartink.com/screener/mark-minervini-10466",
+"chartink_page_size": 500,
+"screener_include_numeric_codes": false,
+"screener_page_delay_sec": 1.0,
+"screener_max_retries": 3,
+"screener_retry_base_delay": 2.0
+```
+
+**Source Selection:**
+- `get_watchlist_from_url: false` loads symbols from `csv_path`
+- `get_watchlist_from_url: true` loads symbols from `watchlist_url`
+- `watchlist_source: "auto"` detects the source from the URL domain
+- `watchlist_source: "chartink"` forces Chartink parsing
+- `watchlist_source: "screener"` forces Screener.in parsing
+
+**Chartink Handling:**
+- Opens the screener page with cookie support
+- Extracts CSRF token and scanner query from the page
+- Calls Chartink's backend screener endpoint
+- Fetches all available rows using `chartink_page_size`
+- Extracts symbols from `nsecode`, then common fallback column names
+
+**Screener.in Handling:**
+- Parses company links like `/company/MCX/`
+- Extracts NSE-style symbols from the URL path
+- Skips numeric-only BSE codes by default
+- Follows only real pagination links inside the pagination block
+- Applies request delay and retry/backoff for HTTP 429 rate limits
+- If a later page is rate-limited after symbols were already fetched, logs a warning and continues with collected symbols instead of terminating
+
+**Important:** The Minervini Trend Template is not calculated internally. The upstream watchlist source should already represent the desired Trend Template or screening logic.
+
+---
+
+### 3. VCP Detector (`VCPDetector`)
 
 Detects Volatility Contraction Patterns — the signature setup in Minervini's methodology.
 
@@ -81,7 +128,7 @@ C = Contraction (price tightening)
 
 ---
 
-### 3. Entry Filter (`EntryFilter`)
+### 4. Entry Filter (`EntryFilter`)
 
 Final gate — checks whether the stock is actionable right now.
 
@@ -96,10 +143,12 @@ Final gate — checks whether the stock is actionable right now.
 - **Breakout Confirmed**: price in buy zone AND volume ≥ 1.5x 50-day avg
 - **Extended**: >5% above pivot (too late, skip)
 - **Pre-breakout**: price below pivot
+- Buy/sell decisions use raw unrounded price and volume values; rounded values are only for display. This prevents false positives around values like `-0.0%` from pivot.
+- In-buy-zone stocks with insufficient volume are labelled `WATCH (low vol)` and include a reason such as `Volume 0.98x below required 1.50x`.
 
 ---
 
-### 4. Stock Screener (`StockScreener`)
+### 5. Stock Screener (`StockScreener`)
 
 Full pipeline for one symbol:
 ```
@@ -110,7 +159,7 @@ fetch → VCP (6M + 3M) → entry filter → ScreenResult
 
 ---
 
-### 5. Master Screener (`MasterScreener`)
+### 6. Master Screener (`MasterScreener`)
 
 Concurrent orchestrator using ThreadPoolExecutor.
 
@@ -175,6 +224,11 @@ class ScreenResult:
     base_length_days: int
     volume_dryup_pct: float
     action: str                   # "BUY ZONE" | "WATCH" | "EXTENDED" | "PRE-BREAKOUT"
+    stop_loss: float
+    stop_pct: float
+    stop_type: str                # "STRUCTURE" | "FIXED_MAX"
+    target_2r: float
+    target_3r: float
     skip_reason: str
 ```
 
@@ -186,9 +240,16 @@ All parameters are configurable via `config.json`:
 
 ```json
 {
-    "csv_path": "Mark Minervini.csv",
+    "csv_path": "Backtest Mark Minervini - Drilldown.csv",
+    "get_watchlist_from_url": true,
+    "watchlist_source": "auto",
+    "watchlist_url": "https://chartink.com/screener/mark-minervini-10466",
+    "chartink_page_size": 500,
+    "screener_include_numeric_codes": false,
+    "screener_page_delay_sec": 1.0,
+    "screener_max_retries": 3,
+    "screener_retry_base_delay": 2.0,
     "max_threads": 15,
-    "min_avg_volume": 100000,
     "request_delay_sec": 0.35,
     "max_retries": 3,
     "retry_base_delay": 2.0,
@@ -198,7 +259,9 @@ All parameters are configurable via `config.json`:
     "vcp_volume_decline_ratio": 0.90,
     "vcp_lookback_candles": 60,
     "entry_buy_zone_max_pct": 0.05,
-    "entry_min_vol_ratio": 1.50
+    "entry_min_vol_ratio": 1.50,
+    "entry_max_stop_pct": 0.08,
+    "entry_min_avg_volume": 40000
 }
 ```
 
@@ -208,6 +271,28 @@ All parameters are configurable via `config.json`:
 
 ```bash
 python minervini_screener.py
+```
+
+**Switching Watchlist Sources:**
+
+Use Chartink:
+```json
+"get_watchlist_from_url": true,
+"watchlist_source": "auto",
+"watchlist_url": "https://chartink.com/screener/mark-minervini-10466"
+```
+
+Use Screener.in:
+```json
+"get_watchlist_from_url": true,
+"watchlist_source": "auto",
+"watchlist_url": "https://www.screener.in/screens/3364489/mark-minervini-setup/"
+```
+
+Use local file:
+```json
+"get_watchlist_from_url": false,
+"csv_path": "Backtest Mark Minervini - Drilldown.csv"
 ```
 
 **Output:**
@@ -222,7 +307,7 @@ python minervini_screener.py
 | Action | Description |
 |--------|-------------|
 | `BUY ZONE` | In buy zone (0-5% above pivot) with volume surge |
-| `WATCH (low vol)` | In buy zone but volume below threshold |
+| `WATCH (low vol)` | In buy zone but volume below threshold; reason includes the actual volume ratio |
 | `PRE-BREAKOUT` | Price below pivot |
 | `EXTENDED` | >5% above pivot (too late to enter) |
 
@@ -238,6 +323,8 @@ pip install pandas tabulate openpyxl jugaad-trader
 - **tabulate**: Formatted table output
 - **openpyxl**: Excel file support
 - **jugaad-trader**: Zerodha KiteConnect wrapper
+
+URL watchlist loading uses Python standard library modules (`urllib`, `http.cookiejar`, `re`) and does not require `requests`.
 
 ---
 
@@ -263,7 +350,7 @@ pip install pandas tabulate openpyxl jugaad-trader
 markminervini/
 ├── minervini_screener.py   # Main screener
 ├── config.json             # Configuration
-├── Mark Minervini.csv      # Watchlist
+├── Backtest Mark Minervini - Drilldown.csv  # Optional local watchlist
 ├── logs/                   # Log files
 └── minervini_results_*.csv # Output results
 ```
