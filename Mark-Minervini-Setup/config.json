@@ -1,0 +1,18 @@
+{
+    "backtest_csv_path": "Mark Minervini.csv",
+    "csv_path": "Backtest Mark Minervini - Drilldown.csv",
+    "max_threads": 15,
+    "min_avg_volume": 100000,
+    "request_delay_sec":        0.35,
+    "max_retries":              3,
+    "retry_base_delay":         2.0,
+    "vcp_min_contractions":     2,
+    "vcp_max_first_depth":      0.40,
+    "vcp_contraction_ratio":    1.10,
+    "vcp_volume_decline_ratio": 0.90,
+    "vcp_lookback_candles":     60,
+    "entry_buy_zone_max_pct":   0.05,
+    "entry_min_vol_ratio":      1.50,
+    "entry_max_stop_pct":       0.08,
+    "entry_min_avg_volume":     40000
+}
